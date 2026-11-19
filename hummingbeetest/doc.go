@@ -18,4 +18,8 @@
 // For shapes the format names no reason for, it answers not_an_object (a value
 // that must be an object is not one), not_an_array (changes or related is not
 // an array) or invalid_time (occurred_at is not RFC 3339).
+//
+// [DryRun] returns an HTTP client for [hummingbee.WithHTTPClient] that sends
+// nothing: it logs each event and answers it accepted, for a deployment that
+// should build its events but not send them.
 package hummingbeetest
