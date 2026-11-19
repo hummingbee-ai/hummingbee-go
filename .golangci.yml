@@ -60,6 +60,11 @@ linters:
           - forcetypeassert
           - gosec
           - prealloc
+      # Ginkgo and Gomega are written to be dot-imported in specs.
+      - path: _test\.go
+        linters:
+          - revive
+        text: dot-imports
 
 formatters:
   enable:
