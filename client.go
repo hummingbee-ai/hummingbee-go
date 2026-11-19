@@ -18,6 +18,7 @@ const (
 // once, and share it: it is safe to use from several goroutines.
 type Client struct {
 	baseURL        string
+	clock          clock
 	httpClient     *http.Client
 	maxAttempts    int
 	organizationID string
@@ -31,6 +32,7 @@ type Option func(*Client)
 func New(token string, options ...Option) *Client {
 	c := &Client{
 		baseURL:     DefaultBaseURL,
+		clock:       realClock,
 		httpClient:  &http.Client{Timeout: defaultTimeout},
 		maxAttempts: defaultMaxAttempts,
 		token:       token,

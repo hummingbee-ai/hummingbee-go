@@ -76,8 +76,11 @@ type errorResponse struct {
 // order given.
 //
 // More than [MaxBatch] events return [ErrTooManyEvents] before any request,
-// and no events send nothing. A response that is not a success is an
-// [*APIError].
+// and no events send nothing. Transport errors and the statuses 408, 429, 500,
+// 502, 503 and 504 are retried with backoff, honouring Retry-After, up to the
+// attempt limit and never past ctx's deadline. Every other response that is
+// not a success returns at once as an [*APIError], and so does the last
+// attempt's retryable status.
 func (c *Client) Send(ctx context.Context, events []Event) ([]Result, error) {
 	if len(events) > MaxBatch {
 		return nil, fmt.Errorf("failed to send %d events: %w", len(events), ErrTooManyEvents)
@@ -89,7 +92,7 @@ func (c *Client) Send(ctx context.Context, events []Event) ([]Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to send %d events: %w", len(events), err)
 	}
-	results, err := c.attempt(ctx, body, len(events))
+	results, err := c.sendWithRetries(ctx, body, len(events))
 	if err != nil {
 		return nil, fmt.Errorf("failed to send %d events: %w", len(events), err)
 	}
@@ -113,7 +116,7 @@ func (c *Client) encode(events []Event) ([]byte, error) {
 func (c *Client) attempt(ctx context.Context, body []byte, count int) ([]Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+eventsPath, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %w", err)
+		return nil, &permanentError{err: fmt.Errorf("failed to build request: %w", err)}
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.token)
@@ -136,10 +139,10 @@ func (c *Client) attempt(ctx context.Context, body []byte, count int) ([]Result,
 	}
 	var decoded sendResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&decoded); err != nil {
-		return nil, &responseError{err: fmt.Errorf("failed to decode results: %w", err)}
+		return nil, &permanentError{err: fmt.Errorf("failed to decode results: %w", err)}
 	}
 	if len(decoded.Results) != count {
-		return nil, &responseError{err: fmt.Errorf("server returned %d results for %d events", len(decoded.Results), count)}
+		return nil, &permanentError{err: fmt.Errorf("server returned %d results for %d events", len(decoded.Results), count)}
 	}
 	return decoded.Results, nil
 }
