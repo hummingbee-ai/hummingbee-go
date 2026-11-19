@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "project": "hummingbee-go",
+  "repo": {
+    "originUrl": "https://github.com/hummingbee-ai/hummingbee-go",
+    "displayName": "hummingbee-go",
+    "defaultBaseBranch": "main",
+    "setupScript": "if [ -f \"$REPO_DIR/.env\" ]; then install -m 600 \"$REPO_DIR/.env\" \"$WORKTREE_DIR/.env\"; fi; if [ -f \"$WORKTREE_DIR/go.mod\" ]; then cd \"$WORKTREE_DIR\" && go mod download; fi",
+    "settings": {
+      "canAutoMerge": true,
+      "canAutoMergeDependabot": true,
+      "mergeStrategy": "rebase",
+      "canAutoRepair": true,
+      "shouldArchiveSessionsAfterMerge": true,
+      "canAutoDeleteBranches": true,
+      "shouldKeepBranchesCurrent": false
+    },
+    "secrets": {
+      "linearApiKey": {
+        "env": "BOSS_LINEAR_API_KEY"
+      }
+    }
+  },
+  "daemons": [
+    {
+      "name": "kamikai",
+      "daemonId": "4e28b20cd7fee13a",
+      "path": "~/Documents/Code/fresh-claim/hummingbee-go"
+    }
+  ],
+  "crons": []
+}

@@ -1,0 +1,33 @@
+{
+  "commands": {
+    "lint": "make check",
+    "test": "make test",
+    "format": "make fix"
+  },
+  "trackerConfig": {
+    "linear": {
+      "mcpServer": "hummingbee-linear",
+      "workspace": "hummingbee",
+      "team": "Hummingbee",
+      "teamKey": "HUM",
+      "states": {
+        "backlog": "Backlog",
+        "unplanned": "Unplanned",
+        "done": "Done",
+        "canceled": "Canceled",
+        "duplicate": "Duplicate"
+      },
+      "labels": {
+        "bug": "Bug",
+        "improvement": "Improvement",
+        "feature": "Feature"
+      },
+      "followUpLabels": ["agent-plan"]
+    }
+  },
+  "verifyDefaults": {
+    "merge": {
+      "auto": [{ "level": "high" }, { "level": "moderate" }, { "level": "low" }]
+    }
+  }
+}
