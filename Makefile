@@ -5,7 +5,7 @@ MODULE := github.com/hummingbee-ai/hummingbee-go
 # Must match the version CI installs in .github/workflows/check.yml.
 GOLANGCI_LINT_VERSION := v2.15.0
 # The packages a firm imports. They may import the standard library only.
-STDLIB_ONLY_PKGS := .
+STDLIB_ONLY_PKGS := . ./hummingbeetest
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-14s %s\n", $$1, $$2}'
