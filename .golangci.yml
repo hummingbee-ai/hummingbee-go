@@ -1,0 +1,67 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+# No output caps: golangci's defaults hide violations past the cap.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - exhaustive
+    - forbidigo
+    - forcetypeassert
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nolintlint
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+
+  settings:
+    forbidigo:
+      forbid:
+        # The client never logs: retries show only through the final error.
+        # The dry run logs through the *slog.Logger it is given.
+        - pattern: ^(fmt\.Print.*|print|println)$
+          msg: a library must not write to standard output; return an error or log through a given *slog.Logger
+        - pattern: ^log\.
+          msg: a library must not use the global logger; log through a given *slog.Logger
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+    gosec:
+      excludes:
+        - G101 # hardcoded credentials: false positives on constant names
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    # A public library: every exported name carries a doc comment, so the
+    # documentation checks Hummingbee's own service turns off stay on here.
+    staticcheck:
+      checks: ["all"]
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - forbidigo
+          - forcetypeassert
+          - gosec
+          - prealloc
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

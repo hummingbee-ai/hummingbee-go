@@ -1,3 +1,6 @@
 .env
 .envrc
 .DS_Store
+# go test -c and -coverprofile output
+*.test
+*.out
