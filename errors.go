@@ -29,13 +29,14 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("events endpoint answered %d %s: %s", e.StatusCode, e.Code, e.Message)
 }
 
-// responseError is a success status whose body cannot be used: it does not
-// decode, or its results do not number the events sent. Sending the same
-// bytes again would get the same answer, so it is never retried.
-type responseError struct {
+// permanentError is a failure that sending the same bytes again would meet
+// again, so it is never retried: a request that cannot be built, or a success
+// status whose body does not decode or whose results do not number the events
+// sent.
+type permanentError struct {
 	err error
 }
 
-func (e *responseError) Error() string { return e.err.Error() }
+func (e *permanentError) Error() string { return e.err.Error() }
 
-func (e *responseError) Unwrap() error { return e.err }
+func (e *permanentError) Unwrap() error { return e.err }
