@@ -155,6 +155,41 @@ var _ = Describe("Send's retries", func() {
 		Expect(recorded.List()).To(HaveLen(1))
 	})
 
+	It("retries a success whose body breaks off before it is read", func() {
+		rec := newRecorder(func(w http.ResponseWriter, attempt int, body []byte) {
+			if attempt > 1 {
+				acceptAll(w, attempt, body)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"results":[`))
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		})
+		client, recorded := retryClient(rec.server.URL)
+
+		results, err := client.Send(ctx, twoEvents())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(results).To(HaveLen(2))
+		Expect(rec.Requests()).To(HaveLen(2))
+		Expect(recorded.List()).To(HaveLen(1))
+	})
+
+	It("returns at once on a success whose body is not JSON", func() {
+		rec := newRecorder(func(w http.ResponseWriter, _ int, _ []byte) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html>not json</html>`))
+		})
+		client, recorded := retryClient(rec.server.URL)
+
+		_, err := client.Send(ctx, twoEvents())
+		Expect(err).To(MatchError(ContainSubstring("failed to decode results")))
+		Expect(rec.Requests()).To(HaveLen(1))
+		Expect(recorded.List()).To(BeEmpty())
+	})
+
 	It("waits as long as Retry-After says in seconds", func() {
 		rec := newRecorder(failFirst(1, http.StatusTooManyRequests, "Retry-After", "2"))
 		client, recorded := retryClient(rec.server.URL)

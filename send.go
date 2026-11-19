@@ -137,8 +137,14 @@ func (c *Client) attempt(ctx context.Context, body []byte, count int) ([]Result,
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, readAPIError(resp)
 	}
+	// A body that breaks off is a transport error and is retried; one read in
+	// full that does not decode is permanent.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read results: %w", err)
+	}
 	var decoded sendResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&decoded); err != nil {
+	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return nil, &permanentError{err: fmt.Errorf("failed to decode results: %w", err)}
 	}
 	if len(decoded.Results) != count {

@@ -31,8 +31,9 @@ func (e *APIError) Error() string {
 
 // permanentError is a failure that sending the same bytes again would meet
 // again, so it is never retried: a request that cannot be built, or a success
-// status whose body does not decode or whose results do not number the events
-// sent.
+// status whose body, read in full, does not decode or whose results do not
+// number the events sent. A body that breaks off while it is read is a
+// transport error, not a permanentError.
 type permanentError struct {
 	err error
 }
