@@ -5,7 +5,7 @@
     "originUrl": "https://github.com/hummingbee-ai/hummingbee-go",
     "displayName": "hummingbee-go",
     "defaultBaseBranch": "main",
-    "setupScript": "if [ -f \"$REPO_DIR/.env\" ]; then install -m 600 \"$REPO_DIR/.env\" \"$WORKTREE_DIR/.env\"; fi; if [ -f \"$WORKTREE_DIR/go.mod\" ]; then cd \"$WORKTREE_DIR\" && go mod download; fi",
+    "setupScript": "make setup-worktree",
     "settings": {
       "canAutoMerge": true,
       "canAutoMergeDependabot": true,

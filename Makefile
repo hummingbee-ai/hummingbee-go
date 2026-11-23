@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help check check-fmt check-tidy check-stdlib fix lint test vet
+.PHONY: help check check-fmt check-tidy check-stdlib fix lint setup-worktree test vet
 
 MODULE := github.com/hummingbee-ai/hummingbee-go
 # Must match the version CI installs in .github/workflows/check.yml.
@@ -52,3 +52,14 @@ test: ## The specs (Ginkgo and Gomega) with the race detector
 
 fix: ## Apply gofmt
 	gofmt -w .
+
+setup-worktree: ## Prepare a git worktree (.env and Go modules)
+	@set -eu; \
+	worktree_dir="$${WORKTREE_DIR:-$(CURDIR)}"; \
+	repo_dir="$${REPO_DIR:-$$(dirname "$$(git rev-parse --path-format=absolute --git-common-dir)")}"; \
+	if [ -f "$$repo_dir/.env" ] && [ "$${repo_dir%/}" != "$${worktree_dir%/}" ]; then \
+		install -m 600 "$$repo_dir/.env" "$$worktree_dir/.env"; \
+	fi; \
+	if [ -f "$$worktree_dir/go.mod" ]; then \
+		cd "$$worktree_dir" && go mod download; \
+	fi

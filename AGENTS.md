@@ -27,6 +27,7 @@ hummingbeetest/  NewServer, the fake events endpoint, and DryRun, the HTTP clien
 | `make check-stdlib` | Fail, naming them, if `hummingbee` or `hummingbeetest` import anything outside the standard library and this module. Test files do not count |
 | `make test` | The specs, with the race detector |
 | `make fix` | `gofmt -w .` |
+| `make setup-worktree` | Copy `.env` from the main checkout and download Go modules into a worktree |
 
 ## Conventions
 
