@@ -341,6 +341,9 @@ func runRound(
 	claimed, err := q.claim(ctx, token, leaseMicros, cfg.batchSize)
 	if err != nil {
 		if ctx.Err() != nil {
+			// Postgres may have committed the autocommitted UPDATE before ctx
+			// was cancelled while reading the RETURNING rows.
+			releaseLeases(ctx, q, token, cfg.logger)
 			return 0, true, nil
 		}
 		*consecutiveFailures++
