@@ -4,8 +4,9 @@ The Go client for Hummingbee's events endpoint. A firm's software sends an event
 
 - `hummingbee`: the event types and the client. `Send` posts a batch of up to 500 events with gzip, retries and backoff, and reports each event as accepted, a duplicate or rejected with a reason.
 - `hummingbeetest`: a fake events server for a firm's own tests, and a dry-run HTTP client that logs events without sending them.
+- `outbox`: an optional transactional Postgres outbox. `Add` writes an event inside the firm's own database transaction, and `Relay` sends waiting rows in batches across one or more replicas.
 
-Both packages import the standard library only.
+`hummingbee` and `hummingbeetest` import the standard library only. `outbox` is optional and brings pgx and GORM; software that imports only `hummingbee` never compiles them.
 
 ## Install
 
@@ -81,6 +82,143 @@ if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
 ```
 
 The client never logs, and the token never appears in an error or in the client's `String()`.
+
+## Outbox
+
+Sending directly inside a request can lose an event if the process stops or Hummingbee is unreachable, or send an event for a change that then rolls back. Package `github.com/hummingbee-ai/hummingbee-go/outbox` provides a transactional Postgres outbox: `outbox.Add` writes the event inside the transaction that makes the change, and `outbox.Relay` sends committed rows afterwards in batches of up to 500.
+
+### 1. Apply the schema
+
+`outbox.Schema` holds the idempotent Postgres DDL that creates `outbox.Table` (`hummingbee_outbox`) and its partial index on pending rows (`WHERE rejected_at IS NULL`). There is no built-in migration runner: apply `outbox.Schema` in your own database migrations. Running it more than once is safe:
+
+```go
+import "github.com/hummingbee-ai/hummingbee-go/outbox"
+
+if _, err := db.ExecContext(ctx, outbox.Schema); err != nil {
+	return fmt.Errorf("failed to apply outbox schema: %w", err)
+}
+```
+
+### 2. Add events inside a transaction
+
+`outbox.Add(ctx, tx, event)` encodes `event` as JSON and inserts one row into `hummingbee_outbox` through `tx`, so the event commits or rolls back with the change. It never opens a transaction or connection of its own and does not validate event fields: the server is the authority.
+
+```go
+event := hummingbee.Event{
+	Actor: hummingbee.System("order-sync"),
+	Changes: []hummingbee.Change{{
+		Field: "status", From: "submitted", To: "paid",
+	}},
+	ID:         "order-status-" + change.ID,
+	OccurredAt: change.CreatedAt,
+	Related: []hummingbee.Ref{
+		{ID: order.CustomerID, Kind: "customer"},
+	},
+	Subject: hummingbee.Ref{ID: order.ID, Kind: "order"},
+	Type:    "order.status_changed",
+}
+```
+
+`Add` accepts all three Postgres transaction kinds:
+
+- **`database/sql` (`*sql.Tx`)**:
+
+  ```go
+  tx, err := db.BeginTx(ctx, nil)
+  if err != nil {
+  	return err
+  }
+  defer tx.Rollback()
+
+  // ... update the order using tx ...
+
+  if err := outbox.Add(ctx, tx, event); err != nil {
+  	return err
+  }
+  return tx.Commit()
+  ```
+
+- **`pgx` (`pgx.Tx`, including transactions from `*pgxpool.Pool`)**:
+
+  ```go
+  tx, err := pool.Begin(ctx)
+  if err != nil {
+  	return err
+  }
+  defer tx.Rollback(ctx)
+
+  // ... update the order using tx ...
+
+  if err := outbox.Add(ctx, tx, event); err != nil {
+  	return err
+  }
+  return tx.Commit(ctx)
+  ```
+
+- **GORM (`*gorm.DB` inside `Transaction`)**:
+
+  ```go
+  err := gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+  	// ... update the order using tx ...
+
+  	return outbox.Add(ctx, tx, event)
+  })
+  ```
+
+Passing a `*gorm.DB` outside a transaction returns `outbox.ErrNotInTransaction`. Passing `nil` or any other handle (such as `*sql.DB` or `*pgxpool.Pool`) returns `outbox.ErrUnsupportedTx`.
+
+### 3. Run the relay once per replica
+
+Start `outbox.Relay(ctx, db, client, options...)` once per application replica. `db` may be a `*sql.DB`, a `*pgxpool.Pool` or a `*gorm.DB`, and `sender` is an `outbox.Sender` (which `*hummingbee.Client` satisfies). Any other database handle returns `outbox.ErrUnsupportedDB` at once.
+
+```go
+go func() {
+	err := outbox.Relay(ctx, db, client,
+		outbox.WithLogger(slog.Default()),
+	)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("outbox relay stopped", slog.Any("err", err))
+	}
+}()
+```
+
+Each round claims waiting rows in one autocommitted statement with `FOR UPDATE SKIP LOCKED`, a random lease token and a database-clock lease, so no transaction stays open during HTTP calls and several replicas never hold the same row at once.
+
+`Relay` runs until `ctx` is cancelled. On shutdown it abandons any in-flight request, releases the leases it still holds on a short detached timeout (two seconds) so another replica can send those rows at once, and returns `ctx.Err()`.
+
+### Options
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `WithBatchSize(n)` | `500` (`hummingbee.MaxBatch`) | Maximum rows claimed per round, clamped to `1`..`500`. |
+| `WithLease(d)` | `5m` | How long a claimed batch is leased before another relay may reclaim it. Each `Send` times out at four fifths of the lease. Non-positive values are ignored. |
+| `WithPollInterval(d)` | `1s` | Wait between polls when a claim returned fewer than a full batch; a full batch claims again at once. Non-positive values are ignored. |
+| `WithLogger(logger)` | `slog.Default()` | Logs per-round counts and errors only, never event values. A `nil` logger is ignored. |
+
+### Delivery semantics
+
+Claimed rows are split into sub-batches of at most 1 MiB of event JSON to stay beneath the endpoint's 2 MiB wire limit. All deletes and updates match the claim's `lease_token`, so a relay whose lease expired never overwrites a row reclaimed by another replica.
+
+- **Accepted and duplicate**: rows whose result is `accepted` or `duplicate` are deleted from `hummingbee_outbox`.
+- **Rejected**: rows rejected by Hummingbee stay in `hummingbee_outbox` with `rejected_at`, `rejected_field` and `rejected_reason` set and are never claimed again. An event whose encoded JSON exceeds 1 MiB on its own is rejected locally with `rejected_reason = 'too_large'` without being sent.
+- **Failed requests**: when `Send` returns an error (after the client's own retries, or on a non-retryable error such as `401`), every un-settled row stays in the table with `last_error` set, its lease token cleared and `leased_until` pushed forward with exponential backoff (starting at the poll interval and doubling per consecutive failed round up to one minute, resetting on success). The relay logs the failure and keeps running.
+
+To inspect rejected rows:
+
+```sql
+SELECT id, event_id, attempts, created_at, rejected_at, rejected_field, rejected_reason
+FROM hummingbee_outbox
+WHERE rejected_at IS NOT NULL
+ORDER BY rejected_at DESC;
+```
+
+### Scope limits
+
+- **Postgres 10+ only**: uses `GENERATED ALWAYS AS IDENTITY` and `FOR UPDATE SKIP LOCKED`. There is no MySQL or SQLite adapter.
+- **Polling, no `LISTEN`/`NOTIFY`**: the relay polls on `WithPollInterval` when idle and claims again immediately after a full batch.
+- **No ordering guarantee across replicas**: events carry `occurred_at`, and Hummingbee keeps both event time and arrival time.
+- **No unique constraint on `event_id`**: adding the same `event_id` twice never fails the firm's transaction; Hummingbee keeps the first copy and answers `duplicate` for later ones, which the relay deletes.
+- **No automatic purge or replay of rejected rows**: read them with SQL above and delete or fix them manually.
 
 ## Testing with hummingbeetest
 
