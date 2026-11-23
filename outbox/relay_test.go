@@ -2,13 +2,16 @@ package outbox_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -43,6 +46,12 @@ type senderFunc func(ctx context.Context, events []hummingbee.Event) ([]hummingb
 
 func (f senderFunc) Send(ctx context.Context, events []hummingbee.Event) ([]hummingbee.Result, error) {
 	return f(ctx, events)
+}
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 type syncBuffer struct {
@@ -1041,5 +1050,80 @@ var _ = Describe("Relay", func() {
 		Expect(logged).To(ContainSubstring("rejected=1"))
 		Expect(logged).To(ContainSubstring("failed=0"))
 		Expect(logged).NotTo(ContainSubstring(canary))
+	})
+
+	It("preserves >53-bit integer and high-precision decimal change values verbatim on the wire", func() {
+		const (
+			largeInt    int64  = (1 << 53) + 1 // 9007199254740993; float64 rounds this to 9007199254740992
+			largeUint   uint64 = math.MaxUint64
+			highPrecNum        = json.Number("12345678901234567890.123456789")
+		)
+		ev := sampleEvent("order-precise-numbers")
+		ev.Changes = []hummingbee.Change{
+			{Field: "big_int", From: largeInt, To: largeUint},
+			{Field: "amount", From: json.Number("0.000000000000000001"), To: highPrecNum},
+		}
+		addEventsBulk(ctx, []hummingbee.Event{ev})
+
+		var mu sync.Mutex
+		var wireBodies []string
+		httpClient := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				rawBody, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				req.Body = io.NopCloser(bytes.NewReader(rawBody))
+
+				zr, err := gzip.NewReader(bytes.NewReader(rawBody))
+				if err != nil {
+					return nil, err
+				}
+				decoded, err := io.ReadAll(zr)
+				_ = zr.Close()
+				if err != nil {
+					return nil, err
+				}
+				mu.Lock()
+				wireBodies = append(wireBodies, string(decoded))
+				mu.Unlock()
+
+				return http.DefaultTransport.RoundTrip(req)
+			}),
+		}
+
+		client := server.Client(hummingbee.WithHTTPClient(httpClient))
+		var sentChanges []hummingbee.Change
+		sender := senderFunc(func(sendCtx context.Context, batch []hummingbee.Event) ([]hummingbee.Result, error) {
+			mu.Lock()
+			if len(batch) == 1 {
+				sentChanges = append([]hummingbee.Change(nil), batch[0].Changes...)
+			}
+			mu.Unlock()
+			return client.Send(sendCtx, batch)
+		})
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- outbox.Relay(relayCtx, testPool, sender, outbox.WithPollInterval(10*time.Millisecond))
+		}()
+
+		Eventually(func() int { return countOutboxRows(ctx) }, 5*time.Second, 10*time.Millisecond).Should(Equal(0))
+		stopRelay()
+		Expect(errors.Is(<-done, context.Canceled)).To(BeTrue())
+
+		Expect(server.Events()).To(HaveLen(1))
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(sentChanges).To(Equal([]hummingbee.Change{
+			{Field: "big_int", From: json.Number("9007199254740993"), To: json.Number("18446744073709551615")},
+			{Field: "amount", From: json.Number("0.000000000000000001"), To: highPrecNum},
+		}))
+		Expect(wireBodies).To(HaveLen(1))
+		Expect(wireBodies[0]).To(ContainSubstring(`"from":9007199254740993`))
+		Expect(wireBodies[0]).To(ContainSubstring(`"to":18446744073709551615`))
+		Expect(wireBodies[0]).To(ContainSubstring(`"from":0.000000000000000001`))
+		Expect(wireBodies[0]).To(ContainSubstring(`"to":12345678901234567890.123456789`))
 	})
 })
