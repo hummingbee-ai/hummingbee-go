@@ -1,0 +1,23 @@
+# Local Postgres 14 for make db-up and make test-db. It trusts every login
+# because it listens only on the loopback address, so the repository holds no
+# password.
+name: hummingbee-go
+
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      # Port 5434, so it runs beside other local Postgres instances.
+      - "127.0.0.1:5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - postgres:/var/lib/postgresql/data
+
+volumes:
+  postgres:
