@@ -334,6 +334,9 @@ func runRound(
 ) (claimedCount int, shutdown bool, roundErr error) {
 	token := newLeaseToken()
 	leaseMicros := max(cfg.lease.Microseconds(), 1)
+	// Anchor one send deadline before claiming so all sub-batches share a single
+	// budget within the claim lease.
+	sendDeadline := time.Now().Add(max(cfg.lease*4/5, time.Millisecond))
 
 	claimed, err := q.claim(ctx, token, leaseMicros, cfg.batchSize)
 	if err != nil {
@@ -367,12 +370,25 @@ func runRound(
 		stats.rejected += len(localRejections)
 	}
 
-	sendTimeout := max(cfg.lease*4/5, time.Millisecond)
-
 	for i, batch := range subBatches {
 		if ctx.Err() != nil {
 			releaseLeases(ctx, q, token, cfg.logger)
 			return len(claimed), true, nil
+		}
+
+		sendCtx, cancelSend := context.WithDeadline(ctx, sendDeadline)
+		if err := sendCtx.Err(); err != nil {
+			cancelSend()
+			if ctx.Err() != nil {
+				releaseLeases(ctx, q, token, cfg.logger)
+				return len(claimed), true, nil
+			}
+			*consecutiveFailures++
+			backoff := nextBackoff(cfg.pollInterval, *consecutiveFailures)
+			stats.failed += countRemaining(subBatches[i:])
+			recordFailure(ctx, q, token, err, backoff, cfg.logger)
+			logRound(ctx, cfg.logger, stats, err)
+			return len(claimed), false, err
 		}
 
 		events := make([]hummingbee.Event, len(batch))
@@ -380,7 +396,6 @@ func runRound(
 			events[j] = item.event
 		}
 
-		sendCtx, cancelSend := context.WithTimeout(ctx, sendTimeout)
 		results, err := sender.Send(sendCtx, events)
 		cancelSend()
 
