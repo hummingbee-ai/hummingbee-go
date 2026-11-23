@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"gorm.io/gorm"
@@ -57,6 +60,58 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+type cancelOnClaimScanConnector struct {
+	base   driver.Connector
+	onScan func() error
+}
+
+func (c *cancelOnClaimScanConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.base.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelOnClaimScanConn{
+		Conn:   conn,
+		onScan: c.onScan,
+	}, nil
+}
+
+func (c *cancelOnClaimScanConnector) Driver() driver.Driver {
+	return c.base.Driver()
+}
+
+type cancelOnClaimScanConn struct {
+	driver.Conn
+	onScan func() error
+}
+
+func (c *cancelOnClaimScanConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+}
+
+func (c *cancelOnClaimScanConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	rows, err := c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelOnClaimScanRows{
+		Rows:   rows,
+		onScan: c.onScan,
+	}, nil
+}
+
+type cancelOnClaimScanRows struct {
+	driver.Rows
+	onScan func() error
+}
+
+func (r *cancelOnClaimScanRows) Next(dest []driver.Value) error {
+	if err := r.onScan(); err != nil {
+		return err
+	}
+	return r.Rows.Next(dest)
 }
 
 func countOutboxRows(ctx context.Context) int {
@@ -867,6 +922,39 @@ var _ = Describe("Relay", func() {
 			Expect(r.LeaseToken.Valid).To(BeFalse())
 			Expect(r.LeasedUntil.Valid).To(BeFalse())
 		}
+	})
+
+	It("releases held leases when ctx is cancelled while reading claim RETURNING rows", func() {
+		addEventsBulk(ctx, []hummingbee.Event{
+			sampleEvent("order-claim-shutdown-1"),
+			sampleEvent("order-claim-shutdown-2"),
+		})
+
+		pgxCfg, err := pgx.ParseConfig(testDatabaseURL)
+		Expect(err).NotTo(HaveOccurred())
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		var cancelOnce sync.Once
+		sqlDB := sql.OpenDB(&cancelOnClaimScanConnector{
+			base: stdlib.GetConnector(*pgxCfg),
+			onScan: func() error {
+				cancelOnce.Do(stopRelay)
+				return relayCtx.Err()
+			},
+		})
+		defer func() { Expect(sqlDB.Close()).To(Succeed()) }()
+
+		err = outbox.Relay(relayCtx, sqlDB, server.Client(), outbox.WithPollInterval(10*time.Millisecond))
+		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
+
+		rows := readOutboxRowStates(ctx)
+		Expect(rows).To(HaveLen(2))
+		for _, r := range rows {
+			Expect(r.Attempts).To(Equal(1))
+			Expect(r.LeaseToken.Valid).To(BeFalse())
+			Expect(r.LeasedUntil.Valid).To(BeFalse())
+		}
+		Expect(server.Events()).To(BeEmpty())
 	})
 
 	It("delivers through *sql.DB, *pgxpool.Pool and *gorm.DB and rejects unsupported db handles", func() {
