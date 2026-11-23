@@ -659,6 +659,143 @@ var _ = Describe("Relay", func() {
 		Expect(server.Events()).To(HaveLen(count))
 	})
 
+	It("shares one claim-anchored send deadline across sub-batches within the single claim lease", func() {
+		const count = 7
+		events := make([]hummingbee.Event, count)
+		for i := range events {
+			events[i] = largeValidEvent(fmt.Sprintf("order-deadline-%02d", i))
+		}
+		addEventsBulk(ctx, events)
+
+		const lease = 500 * time.Millisecond
+
+		var mu sync.Mutex
+		var deadlines []time.Time
+		var firstSendStart time.Time
+		var secondTimedOutAt time.Time
+		var callNum int
+		secondTimedOut := make(chan struct{})
+		var secondOnce sync.Once
+
+		sender := senderFunc(func(sendCtx context.Context, batch []hummingbee.Event) ([]hummingbee.Result, error) {
+			deadline, ok := sendCtx.Deadline()
+			Expect(ok).To(BeTrue())
+
+			mu.Lock()
+			callNum++
+			n := callNum
+			deadlines = append(deadlines, deadline)
+			if n == 1 {
+				firstSendStart = time.Now()
+			}
+			mu.Unlock()
+
+			if n == 1 {
+				timer := time.NewTimer(150 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-sendCtx.Done():
+					return nil, sendCtx.Err()
+				}
+				results := make([]hummingbee.Result, len(batch))
+				for i, ev := range batch {
+					results[i] = hummingbee.Result{
+						ID:     ev.ID,
+						Index:  i,
+						Status: hummingbee.StatusAccepted,
+					}
+				}
+				return results, nil
+			}
+
+			<-sendCtx.Done()
+			mu.Lock()
+			secondTimedOutAt = time.Now()
+			mu.Unlock()
+			secondOnce.Do(func() { close(secondTimedOut) })
+			return nil, sendCtx.Err()
+		})
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- outbox.Relay(
+				relayCtx,
+				testPool,
+				sender,
+				outbox.WithLease(lease),
+				outbox.WithPollInterval(5*time.Second),
+			)
+		}()
+
+		Eventually(secondTimedOut, 5*time.Second).Should(BeClosed())
+		stopRelay()
+		Expect(errors.Is(<-done, context.Canceled)).To(BeTrue())
+
+		mu.Lock()
+		gotDeadlines := append([]time.Time(nil), deadlines...)
+		elapsed := secondTimedOutAt.Sub(firstSendStart)
+		mu.Unlock()
+
+		Expect(gotDeadlines).To(HaveLen(2))
+		Expect(gotDeadlines[1]).To(Equal(gotDeadlines[0]))
+		Expect(elapsed).To(BeNumerically("<", lease))
+	})
+
+	It("stops sending subsequent sub-batches after a slow sub-batch exhausts the single claim lease send deadline", func() {
+		const count = 7
+		events := make([]hummingbee.Event, count)
+		for i := range events {
+			events[i] = largeValidEvent(fmt.Sprintf("order-exhausted-%02d", i))
+		}
+		addEventsBulk(ctx, events)
+
+		const lease = 150 * time.Millisecond
+		var sendCalls atomic.Int32
+		sender := senderFunc(func(_ context.Context, batch []hummingbee.Event) ([]hummingbee.Result, error) {
+			sendCalls.Add(1)
+			time.Sleep(160 * time.Millisecond)
+			results := make([]hummingbee.Result, len(batch))
+			for i, ev := range batch {
+				results[i] = hummingbee.Result{
+					ID:     ev.ID,
+					Index:  i,
+					Status: hummingbee.StatusAccepted,
+				}
+			}
+			return results, nil
+		})
+
+		var logBuf syncBuffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- outbox.Relay(
+				relayCtx,
+				testPool,
+				sender,
+				outbox.WithLease(lease),
+				outbox.WithLogger(logger),
+				outbox.WithPollInterval(5*time.Second),
+			)
+		}()
+
+		Eventually(logBuf.String, 5*time.Second, 10*time.Millisecond).Should(ContainSubstring("outbox relay round failed"))
+		stopRelay()
+		Expect(errors.Is(<-done, context.Canceled)).To(BeTrue())
+
+		Expect(sendCalls.Load()).To(Equal(int32(1)))
+		remaining := readOutboxRowStates(ctx)
+		Expect(remaining).NotTo(BeEmpty())
+		for _, row := range remaining {
+			Expect(row.LastError.Valid).To(BeTrue())
+			Expect(row.LastError.String).To(ContainSubstring(context.DeadlineExceeded.Error()))
+		}
+	})
+
 	It("marks a single event over 1 MiB rejected with too_large and sends the rest", func() {
 		huge := sampleEvent("order-too-large")
 		huge.Changes = []hummingbee.Change{
