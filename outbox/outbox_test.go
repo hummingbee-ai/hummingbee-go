@@ -9,8 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
 	"github.com/hummingbee-ai/hummingbee-go"
@@ -99,6 +101,36 @@ var _ = Describe("Add", func() {
 
 			Expect(readOutboxRows(ctx)).To(BeEmpty())
 		})
+
+		It("commits rows under pgx simple protocol and exec query modes", func() {
+			modes := []struct {
+				eventID string
+				mode    pgx.QueryExecMode
+			}{
+				{eventID: "order-sql-simple", mode: pgx.QueryExecModeSimpleProtocol},
+				{eventID: "order-sql-exec", mode: pgx.QueryExecModeExec},
+			}
+
+			for _, tc := range modes {
+				cfg, err := pgx.ParseConfig(testDatabaseURL)
+				Expect(err).NotTo(HaveOccurred())
+				cfg.DefaultQueryExecMode = tc.mode
+
+				db := stdlib.OpenDB(*cfg)
+				want := sampleEvent(tc.eventID)
+
+				tx, err := db.BeginTx(ctx, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(outbox.Add(ctx, tx, want)).To(Succeed())
+				Expect(tx.Commit()).To(Succeed())
+				Expect(db.Close()).To(Succeed())
+			}
+
+			rows := readOutboxRows(ctx)
+			Expect(rows).To(HaveLen(2))
+			Expect(rows[0].Event).To(Equal(sampleEvent("order-sql-simple")))
+			Expect(rows[1].Event).To(Equal(sampleEvent("order-sql-exec")))
+		})
 	})
 
 	Context("with a pgx.Tx", func() {
@@ -126,6 +158,37 @@ var _ = Describe("Add", func() {
 
 			Expect(readOutboxRows(ctx)).To(BeEmpty())
 		})
+
+		It("commits rows under simple protocol and exec query modes", func() {
+			modes := []struct {
+				eventID string
+				mode    pgx.QueryExecMode
+			}{
+				{eventID: "order-pgx-simple", mode: pgx.QueryExecModeSimpleProtocol},
+				{eventID: "order-pgx-exec", mode: pgx.QueryExecModeExec},
+			}
+
+			for _, tc := range modes {
+				cfg, err := pgx.ParseConfig(testDatabaseURL)
+				Expect(err).NotTo(HaveOccurred())
+				cfg.DefaultQueryExecMode = tc.mode
+
+				conn, err := pgx.ConnectConfig(ctx, cfg)
+				Expect(err).NotTo(HaveOccurred())
+				want := sampleEvent(tc.eventID)
+
+				tx, err := conn.Begin(ctx)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(outbox.Add(ctx, tx, want)).To(Succeed())
+				Expect(tx.Commit(ctx)).To(Succeed())
+				Expect(conn.Close(context.WithoutCancel(ctx))).To(Succeed())
+			}
+
+			rows := readOutboxRows(ctx)
+			Expect(rows).To(HaveLen(2))
+			Expect(rows[0].Event).To(Equal(sampleEvent("order-pgx-simple")))
+			Expect(rows[1].Event).To(Equal(sampleEvent("order-pgx-exec")))
+		})
 	})
 
 	Context("with a *gorm.DB", func() {
@@ -148,6 +211,28 @@ var _ = Describe("Add", func() {
 			preparedDB := testGormDB.Session(&gorm.Session{PrepareStmt: true})
 
 			err := preparedDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return outbox.Add(ctx, tx, want)
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			rows := readOutboxRows(ctx)
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0].EventID).To(Equal(want.ID))
+			Expect(rows[0].Event).To(Equal(want))
+		})
+
+		It("commits one row inside Transaction when PreferSimpleProtocol is enabled", func() {
+			want := sampleEvent("order-gorm-simple-1")
+			simpleDB, err := gorm.Open(postgres.New(postgres.Config{
+				DSN:                  testDatabaseURL,
+				PreferSimpleProtocol: true,
+			}), &gorm.Config{})
+			Expect(err).NotTo(HaveOccurred())
+			sqlDB, err := simpleDB.DB()
+			Expect(err).NotTo(HaveOccurred())
+			defer func() { Expect(sqlDB.Close()).To(Succeed()) }()
+
+			err = simpleDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 				return outbox.Add(ctx, tx, want)
 			})
 			Expect(err).NotTo(HaveOccurred())

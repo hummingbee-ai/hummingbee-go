@@ -42,19 +42,20 @@ func Add(ctx context.Context, tx any, event hummingbee.Event) error {
 		return fmt.Errorf("failed to add event %s to the outbox: %w", event.ID, err)
 	}
 
-	if err := exec(ctx, payload, event.ID); err != nil {
+	// Pass JSON as text so pgx simple-protocol and exec modes do not encode []byte as bytea.
+	if err := exec(ctx, string(payload), event.ID); err != nil {
 		return fmt.Errorf("failed to add event %s to the outbox: %w", event.ID, err)
 	}
 	return nil
 }
 
-func resolveTx(tx any) (func(ctx context.Context, payload []byte, eventID string) error, error) {
+func resolveTx(tx any) (func(ctx context.Context, payload, eventID string) error, error) {
 	switch handle := tx.(type) {
 	case *sql.Tx:
 		if handle == nil {
 			return nil, fmt.Errorf("%w: nil *sql.Tx", ErrUnsupportedTx)
 		}
-		return func(ctx context.Context, payload []byte, eventID string) error {
+		return func(ctx context.Context, payload, eventID string) error {
 			_, err := handle.ExecContext(ctx, insertEventSQL, payload, eventID)
 			return err
 		}, nil
@@ -63,7 +64,7 @@ func resolveTx(tx any) (func(ctx context.Context, payload []byte, eventID string
 		if isTypedNil(handle) {
 			return nil, fmt.Errorf("%w: nil %T", ErrUnsupportedTx, handle)
 		}
-		return func(ctx context.Context, payload []byte, eventID string) error {
+		return func(ctx context.Context, payload, eventID string) error {
 			_, err := handle.Exec(ctx, insertEventSQL, payload, eventID)
 			return err
 		}, nil
@@ -79,7 +80,7 @@ func resolveTx(tx any) (func(ctx context.Context, payload []byte, eventID string
 		if _, ok := pool.(gorm.TxCommitter); !ok {
 			return nil, ErrNotInTransaction
 		}
-		return func(ctx context.Context, payload []byte, eventID string) error {
+		return func(ctx context.Context, payload, eventID string) error {
 			_, err := pool.ExecContext(ctx, insertEventSQL, payload, eventID)
 			return err
 		}, nil
