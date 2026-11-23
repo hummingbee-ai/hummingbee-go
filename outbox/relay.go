@@ -1,6 +1,7 @@
 package outbox
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"gorm.io/gorm"
@@ -479,8 +481,8 @@ func splitClaimedRows(rows []claimedRow) ([][]claimedEvent, []rejectionParam) {
 			continue
 		}
 
-		var ev hummingbee.Event
-		if err := json.Unmarshal(row.raw, &ev); err != nil {
+		ev, err := decodeEvent(row.raw)
+		if err != nil {
 			rejections = append(rejections, rejectionParam{
 				ID:     row.id,
 				Reason: reasonInvalidJSON,
@@ -505,6 +507,81 @@ func splitClaimedRows(rows []claimedRow) ([][]claimedEvent, []rejectionParam) {
 		batches = append(batches, current)
 	}
 	return batches, rejections
+}
+
+type decodedEvent struct {
+	hummingbee.Event
+	Changes []decodedChange `json:"changes,omitempty"`
+}
+
+type decodedChange struct {
+	Field string      `json:"field"`
+	From  changeValue `json:"from"`
+	To    changeValue `json:"to"`
+}
+
+type changeValue struct {
+	value any
+}
+
+func (v *changeValue) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		v.value = nil
+		return nil
+	}
+	switch data[0] {
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		// Keep JSON numbers as json.Number so re-encoding preserves >53-bit
+		// integers and high-precision decimals verbatim.
+		v.value = json.Number(data)
+		return nil
+	case '"':
+		if len(data) >= 2 && data[len(data)-1] == '"' {
+			inner := data[1 : len(data)-1]
+			if bytes.IndexByte(inner, '\\') == -1 && utf8.Valid(inner) {
+				v.value = string(inner)
+				return nil
+			}
+		}
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		v.value = s
+		return nil
+	case 'n':
+		v.value = nil
+		return nil
+	case 't':
+		v.value = true
+		return nil
+	case 'f':
+		v.value = false
+		return nil
+	default:
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		return dec.Decode(&v.value)
+	}
+}
+
+func decodeEvent(raw []byte) (hummingbee.Event, error) {
+	var dec decodedEvent
+	if err := json.Unmarshal(raw, &dec); err != nil {
+		return hummingbee.Event{}, err
+	}
+	ev := dec.Event
+	if dec.Changes != nil {
+		ev.Changes = make([]hummingbee.Change, len(dec.Changes))
+		for i, c := range dec.Changes {
+			ev.Changes[i] = hummingbee.Change{
+				Field: c.Field,
+				From:  c.From.value,
+				To:    c.To.value,
+			}
+		}
+	}
+	return ev, nil
 }
 
 func classifyResults(batch []claimedEvent, results []hummingbee.Result) ([]int64, []rejectionParam, error) {
