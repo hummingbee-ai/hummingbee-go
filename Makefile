@@ -1,11 +1,20 @@
 .DEFAULT_GOAL := help
-.PHONY: help check check-fmt check-tidy check-stdlib fix lint setup-worktree test vet
+.PHONY: help check check-fmt check-tidy check-stdlib db-down db-up fix lint setup-worktree test test-db vet
 
 MODULE := github.com/hummingbee-ai/hummingbee-go
 # Must match the version CI installs in .github/workflows/check.yml.
 GOLANGCI_LINT_VERSION := v2.15.0
 # The packages a firm imports. They may import the standard library only.
 STDLIB_ONLY_PKGS := . ./hummingbeetest
+# Default points at make db-up's Postgres, which trusts loopback logins, so
+# it holds no password. Override to use another local server.
+HUMMINGBEE_TEST_DATABASE_URL ?= postgres://postgres@127.0.0.1:5434/postgres?sslmode=disable
+TEST_PKGS ?= ./...
+GINKGO_LABEL_FILTER ?=
+COMPOSE := docker compose -f compose.yaml
+# Exported per target rather than inlined, so make never echoes a URL or puts
+# it on a command line, and plain make test still skips the database specs.
+test-db: export HUMMINGBEE_TEST_DATABASE_URL := $(HUMMINGBEE_TEST_DATABASE_URL)
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-14s %s\n", $$1, $$2}'
@@ -49,6 +58,16 @@ check-stdlib: ## Fail, naming them, if a guarded package imports outside the sta
 
 test: ## The specs (Ginkgo and Gomega) with the race detector
 	go test -race ./...
+
+# -count=1 because go test's cache cannot see the database's state.
+test-db: ## Run the specs against Postgres on TEST_PKGS (default ./...)
+	go test -race -count=1 $(TEST_PKGS)$(if $(GINKGO_LABEL_FILTER), -ginkgo.label-filter="$(GINKGO_LABEL_FILTER)")
+
+db-up: ## Start the local Postgres 14 on port 5434
+	$(COMPOSE) up -d --wait
+
+db-down: ## Stop the local Postgres, keeping its data
+	$(COMPOSE) down
 
 fix: ## Apply gofmt
 	gofmt -w .
