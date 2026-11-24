@@ -490,15 +490,38 @@ func splitClaimedRows(rows []claimedRow) ([][]claimedEvent, []rejectionParam) {
 			continue
 		}
 
+		// Size against Go's HTML-escaped JSON wire form rather than raw jsonb
+		// bytes, which unescape '<', '>', '&', U+2028 and U+2029 and would
+		// otherwise expand up to 6x in Client.Send.
+		wireSize, err := encodedEventSize(row.raw, ev)
+		if err != nil {
+			rejections = append(rejections, rejectionParam{
+				ID:     row.id,
+				Reason: reasonInvalidJSON,
+			})
+			continue
+		}
+		if wireSize > maxSubBatchBytes {
+			rejections = append(rejections, rejectionParam{
+				ID:     row.id,
+				Reason: reasonTooLarge,
+			})
+			continue
+		}
+
 		item := claimedEvent{
 			event: ev,
 			id:    row.id,
-			size:  len(row.raw),
+			size:  wireSize,
 		}
-		if len(current) > 0 && currentBytes+item.size > maxSubBatchBytes {
+		const arrayBrackets = 2
+		if len(current) > 0 && arrayBrackets+currentBytes+1+item.size > maxSubBatchBytes {
 			batches = append(batches, current)
 			current = nil
 			currentBytes = 0
+		}
+		if len(current) > 0 {
+			currentBytes++
 		}
 		current = append(current, item)
 		currentBytes += item.size
@@ -507,6 +530,31 @@ func splitClaimedRows(rows []claimedRow) ([][]claimedEvent, []rejectionParam) {
 		batches = append(batches, current)
 	}
 	return batches, rejections
+}
+
+func encodedEventSize(raw []byte, ev hummingbee.Event) (int, error) {
+	if !mayExpandOnMarshal(raw) {
+		// Without HTML-escaped characters, U+2028/U+2029 (UTF-8 lead byte 0xe2)
+		// or backslash escapes (such as jsonb's \b/\f, which Go encodes as
+		// \u0008/\u000c), re-marshaling can only add omitted zero-value fields.
+		upper := len(raw) + 128 + len(ev.Changes)*40 + len(ev.Related)*20
+		if upper <= maxSubBatchBytes {
+			return upper, nil
+		}
+	}
+	encoded, err := json.Marshal(ev)
+	if err != nil {
+		return 0, err
+	}
+	return len(encoded), nil
+}
+
+func mayExpandOnMarshal(raw []byte) bool {
+	return bytes.IndexByte(raw, '<') != -1 ||
+		bytes.IndexByte(raw, '>') != -1 ||
+		bytes.IndexByte(raw, '&') != -1 ||
+		bytes.IndexByte(raw, '\\') != -1 ||
+		bytes.IndexByte(raw, 0xe2) != -1
 }
 
 type decodedEvent struct {
