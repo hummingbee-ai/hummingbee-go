@@ -1126,4 +1126,99 @@ var _ = Describe("Relay", func() {
 		Expect(wireBodies[0]).To(ContainSubstring(`"from":0.000000000000000001`))
 		Expect(wireBodies[0]).To(ContainSubstring(`"to":12345678901234567890.123456789`))
 	})
+
+	It("rejects a single event whose HTML-escaped wire JSON exceeds 1 MiB as too_large without hitting 413", func() {
+		// Postgres jsonb stores literal '<' (1 byte, ~360 KiB total <= 1 MiB),
+		// while Client.Send HTML-escapes each '<' to \u003c (6 bytes, ~2.16 MiB > 2 MiB).
+		htmlHuge := sampleEvent("order-html-too-large")
+		htmlHuge.Changes = []hummingbee.Change{
+			{Field: "payload", From: nil, To: strings.Repeat("<", 360*1024)},
+		}
+		normal := sampleEvent("order-after-html-too-large")
+		addEventsBulk(ctx, []hummingbee.Event{htmlHuge, normal})
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- outbox.Relay(
+				relayCtx,
+				testPool,
+				server.Client(hummingbee.WithMaxAttempts(1)),
+				outbox.WithPollInterval(10*time.Millisecond),
+			)
+		}()
+
+		Eventually(func() int { return len(server.Events()) }, 5*time.Second, 10*time.Millisecond).Should(Equal(1))
+		Eventually(func() int { return countOutboxRows(ctx) }, 5*time.Second, 10*time.Millisecond).Should(Equal(1))
+
+		stopRelay()
+		Expect(errors.Is(<-done, context.Canceled)).To(BeTrue())
+
+		Expect(server.Events()[0].ID).To(Equal(normal.ID))
+		Expect(server.Requests()).To(Equal(1))
+
+		rows := readOutboxRowStates(ctx)
+		Expect(rows).To(HaveLen(1))
+		Expect(rows[0].EventID).To(Equal(htmlHuge.ID))
+		Expect(rows[0].RejectedAt.Valid).To(BeTrue())
+		Expect(rows[0].RejectedField.Valid).To(BeTrue())
+		Expect(rows[0].RejectedField.String).To(Equal(""))
+		Expect(rows[0].RejectedReason.Valid).To(BeTrue())
+		Expect(rows[0].RejectedReason.String).To(Equal("too_large"))
+		Expect(rows[0].LeaseToken.Valid).To(BeFalse())
+		Expect(rows[0].LeasedUntil.Valid).To(BeFalse())
+	})
+
+	It("splits valid events whose combined HTML-escaped wire JSON exceeds 1 MiB even when jsonb bytes are under 1 MiB", func() {
+		// Four valid wire-format-v1 events: ~102 KiB each in jsonb (~408 KiB total),
+		// but ~602 KiB each on the wire after HTML escaping (~2.4 MiB combined > 2 MiB).
+		const count = 4
+		events := make([]hummingbee.Event, count)
+		fromVal := strings.Repeat("<", 1000)
+		toVal := strings.Repeat(">", 500) + strings.Repeat("&", 500)
+		for i := range events {
+			ev := sampleEvent(fmt.Sprintf("order-html-split-%02d", i))
+			ev.Changes = make([]hummingbee.Change, 50)
+			for j := range ev.Changes {
+				ev.Changes[j] = hummingbee.Change{
+					Field: fmt.Sprintf("field_%02d", j),
+					From:  fromVal,
+					To:    toVal,
+				}
+			}
+			events[i] = ev
+		}
+		addEventsBulk(ctx, events)
+
+		client := server.Client(hummingbee.WithMaxAttempts(1))
+		var mu sync.Mutex
+		var requestBytes []int
+		sender := senderFunc(func(sendCtx context.Context, batch []hummingbee.Event) ([]hummingbee.Result, error) {
+			raw, err := json.Marshal(batch)
+			Expect(err).NotTo(HaveOccurred())
+			mu.Lock()
+			requestBytes = append(requestBytes, len(raw))
+			mu.Unlock()
+			return client.Send(sendCtx, batch)
+		})
+
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- outbox.Relay(relayCtx, testPool, sender, outbox.WithPollInterval(10*time.Millisecond))
+		}()
+
+		Eventually(func() int { return countOutboxRows(ctx) }, 5*time.Second, 10*time.Millisecond).Should(Equal(0))
+		stopRelay()
+		Expect(errors.Is(<-done, context.Canceled)).To(BeTrue())
+
+		mu.Lock()
+		gotBytes := append([]int(nil), requestBytes...)
+		mu.Unlock()
+		Expect(len(gotBytes)).To(BeNumerically(">", 1))
+		for _, size := range gotBytes {
+			Expect(size).To(BeNumerically("<=", 1<<20))
+		}
+		Expect(server.Events()).To(HaveLen(count))
+	})
 })
